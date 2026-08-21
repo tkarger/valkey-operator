@@ -17,6 +17,9 @@ limitations under the License.
 package aclscan
 
 import (
+	"go/ast"
+	"go/parser"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -77,6 +80,148 @@ func TestBuilderCommandTokens(t *testing.T) {
 	assert.False(t, ok)
 }
 
+func TestScanDirArbitraryNonLiteralCommand(t *testing.T) {
+	dir := t.TempDir()
+	src := `package fake
+
+func run(client any) {
+	cmd := "CLUSTER"
+	client.B().Arbitrary(cmd, "SETSLOT")
+}
+`
+	require.NoError(t, os.WriteFile(dir+"/fake.go", []byte(src), 0o600))
+
+	_, err := scanDir(dir, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Arbitrary call whose command is not a string literal")
+}
+
+func TestScanDirArbitraryTrailingNonLiteral(t *testing.T) {
+	dir := t.TempDir()
+	src := `package fake
+
+import "strconv"
+
+func run(client any) {
+	slot := 1
+	client.B().Arbitrary("CLUSTER", "SETSLOT", strconv.Itoa(slot))
+}
+`
+	require.NoError(t, os.WriteFile(dir+"/fake.go", []byte(src), 0o600))
+
+	commands, err := scanDir(dir, nil)
+	require.NoError(t, err)
+	require.Len(t, commands, 1)
+	assert.Equal(t, []string{"CLUSTER", "SETSLOT"}, commands[0].Tokens)
+}
+
+// TestScanDirArbitraryNonBuilderReceiver is a regression test for an
+// unrelated method that happens to be named Arbitrary but isn't reached via
+// client.B(): it must not be misdetected as a Valkey command.
+func TestScanDirArbitraryNonBuilderReceiver(t *testing.T) {
+	dir := t.TempDir()
+	src := `package fake
+
+func run(formatter any) {
+	formatter.Arbitrary("X")
+}
+`
+	require.NoError(t, os.WriteFile(dir+"/fake.go", []byte(src), 0o600))
+
+	commands, err := scanDir(dir, nil)
+	require.NoError(t, err)
+	assert.Empty(t, commands)
+}
+
+// TestScanDirBuilderCallThroughVariable is a regression test for the
+// `b := client.B(); b.Method()` shape, which aclscan cannot currently
+// resolve: it must be surfaced as an error rather than silently dropped, so
+// the gap doesn't produce an under-reported command set.
+func TestScanDirBuilderCallThroughVariable(t *testing.T) {
+	dir := t.TempDir()
+	src := `package fake
+
+func run(client any) {
+	b := client.B()
+	b.ClusterInfo()
+}
+`
+	require.NoError(t, os.WriteFile(dir+"/fake.go", []byte(src), 0o600))
+
+	_, err := scanDir(dir, map[string][]string{"ClusterInfo": {"CLUSTER", "INFO"}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "builder call made through a variable")
+}
+
+// TestScanDirBuilderCallThroughVarDeclaredVariable is a regression test for
+// the `var b = client.B(); b.Method()` shape: builder variables introduced
+// via a var declaration (*ast.ValueSpec) must be tracked the same way as
+// ones introduced via `:=` (*ast.AssignStmt), or this case would silently
+// under-report commands instead of surfacing the same error.
+func TestScanDirBuilderCallThroughVarDeclaredVariable(t *testing.T) {
+	dir := t.TempDir()
+	src := `package fake
+
+func run(client any) {
+	var b = client.B()
+	b.ClusterInfo()
+}
+`
+	require.NoError(t, os.WriteFile(dir+"/fake.go", []byte(src), 0o600))
+
+	_, err := scanDir(dir, map[string][]string{"ClusterInfo": {"CLUSTER", "INFO"}})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "builder call made through a variable")
+}
+
+// TestScanDirBuilderVarNameNotSharedAcrossFunctions is a regression test
+// ensuring builderVars is scoped per function: a local named `b` bound to
+// client.B() in one function (never itself called through, so it doesn't
+// trip the "unsupported" error above) must not cause an unrelated
+// `b.ClusterInfo()` call on a same-named but different `b` in a separate
+// function to be misdetected as a builder-via-variable call, which would
+// otherwise fail the whole scan over a false positive.
+func TestScanDirBuilderVarNameNotSharedAcrossFunctions(t *testing.T) {
+	dir := t.TempDir()
+	src := `package fake
+
+func run(client any) {
+	b := client.B()
+	_ = b
+}
+
+func other(b any) {
+	b.ClusterInfo()
+}
+`
+	require.NoError(t, os.WriteFile(dir+"/fake.go", []byte(src), 0o600))
+
+	commands, err := scanDir(dir, map[string][]string{"ClusterInfo": {"CLUSTER", "INFO"}})
+	require.NoError(t, err)
+	assert.Empty(t, commands)
+}
+
+// TestScanDirBuilderCallInPackageLevelFuncLiteral is a regression test for a
+// func literal that isn't a top-level *ast.FuncDecl at all, e.g. a
+// package-level `var handler = func() {...}`: scanDir must still descend
+// into it rather than skipping it because it isn't a named function
+// declaration.
+func TestScanDirBuilderCallInPackageLevelFuncLiteral(t *testing.T) {
+	dir := t.TempDir()
+	src := `package fake
+
+var handler = func(client any) {
+	client.B().ClusterInfo()
+}
+`
+	require.NoError(t, os.WriteFile(dir+"/fake.go", []byte(src), 0o600))
+
+	commands, err := scanDir(dir, map[string][]string{"ClusterInfo": {"CLUSTER", "INFO"}})
+	require.NoError(t, err)
+	require.Len(t, commands, 1)
+	assert.Equal(t, []string{"CLUSTER", "INFO"}, commands[0].Tokens)
+}
+
 func TestDedupe(t *testing.T) {
 	in := []Command{
 		{Tokens: []string{"CLUSTER", "INFO"}, Pos: "a.go:1"},
@@ -91,4 +236,42 @@ func TestDedupe(t *testing.T) {
 
 func TestStringLiteralArgs(t *testing.T) {
 	assert.Empty(t, stringLiteralArgs(nil))
+
+	// A non-literal expression (e.g. a variable) means the command's tokens
+	// aren't statically known, so it must resolve to nil rather than being
+	// silently skipped.
+	dynamic, err := parser.ParseExpr("command")
+	require.NoError(t, err)
+	assert.Nil(t, stringLiteralArgs([]ast.Expr{dynamic}))
+
+	literal, err := parser.ParseExpr(`"CLUSTER"`)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"CLUSTER"}, stringLiteralArgs([]ast.Expr{literal}))
+}
+
+func TestLeadingStringLiterals(t *testing.T) {
+	assert.Empty(t, leadingStringLiterals(nil))
+
+	// A non-literal leading argument means the command itself isn't
+	// statically known, so nothing can be resolved.
+	dynamic, err := parser.ParseExpr("command")
+	require.NoError(t, err)
+	assert.Empty(t, leadingStringLiterals([]ast.Expr{dynamic}))
+
+	// An ACL only needs the command and subcommand: a call like
+	// Arbitrary("CLUSTER", "SETSLOT", strconv.Itoa(slot)) resolves to
+	// "CLUSTER SETSLOT" rather than being rejected outright for having a
+	// non-literal trailing argument.
+	cmd, err := parser.ParseExpr(`"CLUSTER"`)
+	require.NoError(t, err)
+	sub, err := parser.ParseExpr(`"SETSLOT"`)
+	require.NoError(t, err)
+	arg, err := parser.ParseExpr(`strconv.Itoa(slot)`)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"CLUSTER", "SETSLOT"}, leadingStringLiterals([]ast.Expr{cmd, sub, arg}))
+
+	// Capped at two tokens even if every argument is a literal.
+	third, err := parser.ParseExpr(`"EXTRA"`)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"CLUSTER", "SETSLOT"}, leadingStringLiterals([]ast.Expr{cmd, sub, third}))
 }

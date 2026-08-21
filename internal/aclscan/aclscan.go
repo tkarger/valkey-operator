@@ -183,8 +183,17 @@ func firstAppendLiterals(body *ast.BlockStmt) []string {
 }
 
 // scanDir walks dir for non-test Go source, looking for `x.B().Method(...)`
-// builder-pattern calls and `x.Arbitrary("A", "B", ...)` calls, resolving
-// them to Valkey command tokens via builderTokens.
+// builder-pattern calls and `x.B().Arbitrary("A", "B", ...)` calls, resolving
+// them to Valkey command tokens via builderTokens (see scanFunc). A bare
+// `y.Method(...)` call is only treated as a command when y is itself an
+// inline `x.B()` call; other receivers (including a variable previously
+// assigned `x.B()`) are not builder calls and are either ignored or, for the
+// variable case, reported as an error so the gap is visible rather than
+// silently under-reporting commands. Every function body — a top-level
+// *ast.FuncDecl or a *ast.FuncLit wherever one appears, e.g. a package-level
+// `var handler = func() {...}` — is scanned independently via scanFunc, so
+// builder-variable tracking can't leak from one function's scope into an
+// unrelated one that happens to reuse the same variable name.
 func scanDir(dir string, builderTokens map[string][]string) ([]Command, error) {
 	var commands []Command
 	fset := token.NewFileSet()
@@ -199,35 +208,91 @@ func scanDir(dir string, builderTokens map[string][]string) ([]Command, error) {
 		if err != nil {
 			return err
 		}
+		var scanErr error
 		ast.Inspect(file, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if !ok {
+			var body *ast.BlockStmt
+			switch fn := n.(type) {
+			case *ast.FuncDecl:
+				body = fn.Body
+			case *ast.FuncLit:
+				body = fn.Body
+			default:
 				return true
 			}
-			sel, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok {
+			if body == nil {
 				return true
 			}
-			pos := fset.Position(call.Pos()).String()
-			if sel.Sel.Name == "Arbitrary" {
-				if tok := stringLiteralArgs(call.Args); tok != nil {
-					commands = append(commands, Command{Tokens: tok, Pos: pos})
-				}
-				return true
+			found, err := scanFunc(body, fset, builderTokens)
+			if err != nil {
+				scanErr = err
+				return false
 			}
-			if isBuilderCall(sel.X) {
-				if tok, ok := builderTokens[sel.Sel.Name]; ok {
-					commands = append(commands, Command{Tokens: tok, Pos: pos})
-				}
-			}
-			return true
+			commands = append(commands, found...)
+			// scanFunc's own ast.Inspect already covers this function's
+			// entire body, including any nested func literals, so don't
+			// descend into it again from here.
+			return false
 		})
-		return nil
+		return scanErr
 	})
 	if err != nil {
 		return nil, err
 	}
 	return commands, nil
+}
+
+// scanFunc scans a single function body for builder-pattern and Arbitrary
+// calls, resolving them to Valkey command tokens via builderTokens.
+// builderVars, which tracks local variables assigned a bare `x.B()` result
+// (whether via `b := client.B()` or `var b = client.B()`), is scoped to this
+// one function body: see scanDir's doc comment for why. A nested func
+// literal shares its enclosing function's builderVars rather than getting
+// its own (scanDir only calls scanFunc at the outermost function it finds),
+// which is a conservative approximation of real lexical scoping but not one
+// that matters in practice for this codebase's style.
+func scanFunc(body *ast.BlockStmt, fset *token.FileSet, builderTokens map[string][]string) ([]Command, error) {
+	var commands []Command
+	var scanErr error
+	builderVars := make(map[string]bool)
+	ast.Inspect(body, func(n ast.Node) bool {
+		if assign, ok := n.(*ast.AssignStmt); ok && len(assign.Lhs) == 1 && len(assign.Rhs) == 1 {
+			if ident, ok := assign.Lhs[0].(*ast.Ident); ok {
+				recordBuilderVar(ident.Name, assign.Rhs[0], builderVars)
+			}
+		}
+		if spec, ok := n.(*ast.ValueSpec); ok && len(spec.Names) == 1 && len(spec.Values) == 1 {
+			recordBuilderVar(spec.Names[0].Name, spec.Values[0], builderVars)
+		}
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		pos := fset.Position(call.Pos()).String()
+		switch {
+		case isBuilderCall(sel.X):
+			if sel.Sel.Name == "Arbitrary" {
+				tok := leadingStringLiterals(call.Args)
+				if len(tok) == 0 {
+					scanErr = fmt.Errorf("%s: Arbitrary call whose command is not a string literal; aclscan cannot resolve it", pos)
+					return false
+				}
+				commands = append(commands, Command{Tokens: tok, Pos: pos})
+				return true
+			}
+			if tok, ok := builderTokens[sel.Sel.Name]; ok {
+				commands = append(commands, Command{Tokens: tok, Pos: pos})
+			}
+		case isBuilderVarRef(sel.X, builderVars):
+			scanErr = fmt.Errorf("%s: builder call made through a variable (e.g. `b := client.B(); b.%s(...)`); aclscan only recognizes the inline client.B().Method() form", pos, sel.Sel.Name)
+			return false
+		}
+		return true
+	})
+	return commands, scanErr
 }
 
 // isBuilderCall reports whether expr is a call to a niladic `B()` method,
@@ -241,9 +306,27 @@ func isBuilderCall(expr ast.Expr) bool {
 	return ok && sel.Sel.Name == "B"
 }
 
+// isBuilderVarRef reports whether expr is a reference to a local variable
+// previously assigned a bare `x.B()` result, per builderVars.
+func isBuilderVarRef(expr ast.Expr, builderVars map[string]bool) bool {
+	ident, ok := expr.(*ast.Ident)
+	return ok && builderVars[ident.Name]
+}
+
+// recordBuilderVar marks name in builderVars if value is a bare `x.B()`
+// call, e.g. the right-hand side of `b := client.B()` or `var b = client.B()`.
+func recordBuilderVar(name string, value ast.Expr, builderVars map[string]bool) {
+	if isBuilderCall(value) {
+		builderVars[name] = true
+	}
+}
+
 // stringLiteralArgs returns the unquoted values of args if every one of them
 // is a string literal, or nil otherwise (e.g. a variable or spread argument).
 func stringLiteralArgs(args []ast.Expr) []string {
+	if len(args) == 0 {
+		return nil
+	}
 	tokens := make([]string, 0, len(args))
 	for _, arg := range args {
 		lit, ok := arg.(*ast.BasicLit)
@@ -253,6 +336,27 @@ func stringLiteralArgs(args []ast.Expr) []string {
 		value, err := strconv.Unquote(lit.Value)
 		if err != nil {
 			return nil
+		}
+		tokens = append(tokens, value)
+	}
+	return tokens
+}
+
+// leadingStringLiterals returns the leading string-literal arguments of
+// args, stopping at the first non-literal (e.g. a slot number formatted via
+// strconv.Itoa) and capped at two, since an ACL only ever needs to know the
+// command and subcommand, not the arguments that follow.
+func leadingStringLiterals(args []ast.Expr) []string {
+	n := min(len(args), 2)
+	tokens := make([]string, 0, n)
+	for _, arg := range args[:n] {
+		lit, ok := arg.(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			break
+		}
+		value, err := strconv.Unquote(lit.Value)
+		if err != nil {
+			break
 		}
 		tokens = append(tokens, value)
 	}
